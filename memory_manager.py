@@ -1,159 +1,238 @@
+# memory_manager.py
+import redis
+import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Tuple, Optional, Dict, Any
-from pymongo import MongoClient, errors as mongo_errors
-from pymongo.collection import Collection
-from config import MONGODB_URI
+from typing import List, Tuple, Optional, Dict
+from pymongo import MongoClient
+from config import REDIS_URL, MONGODB_URI
 
-# Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Singleton globals for DB connection
+# ======================
+# Global clients (cached)
+# ======================
+_redis_client: Optional[redis.Redis] = None
 _mongo_client: Optional[MongoClient] = None
-_collection: Optional[Collection] = None
+_mongo_collection = None
 
-def get_mongo_collection() -> Optional[Collection]:
-    """
-    Initialize MongoDB connection once and reuse it (Singleton Pattern).
-    Returns None if MONGODB_URI is missing or connection fails.
-    """
-    global _mongo_client, _collection
 
-    if _collection is not None:
-        return _collection
+# ======================
+# Redis (Speed Layer)
+# ======================
+def get_redis_client() -> Optional[redis.Redis]:
+    global _redis_client
+
+    if _redis_client is not None:
+        return _redis_client
+
+    if not REDIS_URL:
+        return None
+
+    try:
+        _redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=5,
+            socket_connect_timeout=5
+        )
+        _redis_client.ping()
+        logger.info("✅ Redis connected")
+        return _redis_client
+
+    except Exception as e:
+        logger.error(f"❌ Redis connection failed: {e}")
+        _redis_client = None
+        return None
+
+
+# ======================
+# MongoDB (Source of Truth)
+# ======================
+def get_mongo_collection():
+    """Return MongoDB collection or None (PyMongo-safe)."""
+    global _mongo_client, _mongo_collection
+
+    # 🔴 IMPORTANT: explicit None check (no truthiness!)
+    if _mongo_collection is not None:
+        return _mongo_collection
 
     if not MONGODB_URI:
-        # Log only once to avoid spamming console
-        if not getattr(get_mongo_collection, "has_warned", False):
-            logger.warning("⚠️ MongoDB URI not configured. Persistent memory is OFF.")
-            get_mongo_collection.has_warned = True
         return None
 
     try:
-        # Connect to Atlas or Local Mongo
-        if "mongodb+srv" in MONGODB_URI:
-            _mongo_client = MongoClient(
-                MONGODB_URI,
-                tls=True,
-                serverSelectionTimeoutMS=5000,
-                retryWrites=True
-            )
-        else:
-            _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-
-        # Force a connection check
-        _mongo_client.admin.command("ping")
-        
-        db = _mongo_client["groq_chat_db"]
-        _collection = db["conversations"]
-        
-        # Optimize lookups by User ID and Time
-        _collection.create_index([("user_id", 1), ("timestamp", -1)])
-        
-        logger.info("✅ MongoDB connected successfully")
-        return _collection
-
-    except mongo_errors.ServerSelectionTimeoutError:
-        logger.error("❌ MongoDB Connection Timeout. Check your internet or whitelist settings.")
-        return None
-    except mongo_errors.OperationFailure as e:
-        logger.error(f"❌ MongoDB Authentication Failed: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Unexpected MongoDB Error: {e}")
-        return None
-
-def save_conversation(user_id: str, user_msg: str, ai_msg: str) -> bool:
-    """Save a single conversation turn to MongoDB."""
-    collection = get_mongo_collection()
-    if collection is None:
-        return False
-
-    try:
-        document = {
-            "user_id": user_id,
-            "user_message": user_msg,
-            "ai_response": ai_msg,
-            # Use timezone-aware UTC for modern Python compatibility
-            "timestamp": datetime.now(timezone.utc)
-        }
-        collection.insert_one(document)
-        # logger.info("💾 Saved to DB") # Uncomment if you want verbose logs
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save conversation: {e}")
-        return False
-
-def load_recent_conversations(user_id: str, limit: int = 10) -> List[Tuple[str, str, str]]:
-    """
-    Load recent conversations for the 'History' sidebar UI.
-    Returns: List of (User Message, AI Message, Formatted Time string)
-    """
-    collection = get_mongo_collection()
-    if collection is None:
-        return []
-
-    try:
-        records = collection.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
-        results = []
-        for r in records:
-            ts = r.get("timestamp")
-            # Format time nicely (e.g., "Oct 25, 14:30")
-            fmt_time = ts.strftime("%b %d, %H:%M") if ts else "Unknown"
-            results.append((
-                r.get("user_message", ""),
-                r.get("ai_response", ""),
-                fmt_time
-            ))
-        return results
-    except Exception as e:
-        logger.error(f"Failed to load history: {e}")
-        return []
-
-def get_context_history(user_id: str, limit: int = 5) -> List[Dict[str, str]]:
-    """
-    Get raw conversation history to inject into the LLM context window.
-    Returns: List of dicts [{"role": "user", "content": ...}, ...]
-    """
-    collection = get_mongo_collection()
-    if collection is None:
-        return []
-
-    try:
-        # Fetch recent records (reverse logic: we grab the newest N, then flip them to chronological order)
-        records = collection.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
-        
-        history_sequence = []
-        # 'reversed' ensures we feed the LLM the oldest-of-the-recent first
-        for r in reversed(list(records)):
-            history_sequence.append({"role": "user", "content": r.get("user_message", "")})
-            history_sequence.append({"role": "assistant", "content": r.get("ai_response", "")})
-            
-        return history_sequence
-    except Exception as e:
-        logger.error(f"Failed to retrieve context context: {e}")
-        return []
-    
-
-def delete_last_conversation(user_id: str) -> bool:
-    """Delete the most recent conversation entry for a user."""
-    collection = get_mongo_collection()
-    if collection is None:
-        return False
-
-    try:
-        # Find the latest document
-        latest = collection.find_one(
-            {"user_id": user_id},
-            sort=[("timestamp", -1)]
+        _mongo_client = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=5000
         )
-        
-        if latest:
-            collection.delete_one({"_id": latest["_id"]})
-            logger.info("🗑️ Deleted last conversation turn")
-            return True
-        return False
+        _mongo_client.admin.command("ping")
+
+        # Database + Collection
+        _mongo_collection = _mongo_client["groq_chat_db"]["conversations"]
+        logger.info("✅ MongoDB connected")
+        return _mongo_collection
+
     except Exception as e:
-        logger.error(f"Failed to delete last conversation: {e}")
-        return False
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        _mongo_collection = None
+        return None
+
+
+# ======================
+# Save Conversation
+# ======================
+def save_conversation(user_id: str, user_msg: str, ai_msg: str) -> bool:
+    timestamp = datetime.now(timezone.utc)
+
+    # --- Redis write (best-effort) ---
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.lpush(
+                f"conversation:{user_id}",
+                json.dumps({
+                    "user_message": user_msg,
+                    "ai_response": ai_msg,
+                    "timestamp": timestamp.isoformat()
+                })
+            )
+        except Exception as e:
+            logger.error(f"Redis save failed: {e}")
+
+    # --- Mongo write (source of truth) ---
+    col = get_mongo_collection()
+    if col is not None:
+        try:
+            col.insert_one({
+                "user_id": user_id,
+                "user_message": user_msg,
+                "ai_response": ai_msg,
+                "timestamp": timestamp
+            })
+        except Exception as e:
+            logger.error(f"Mongo save failed: {e}")
+
+    return True
+
+
+# ======================
+# Context History (Redis → Mongo fallback)
+# ======================
+def get_context_history(user_id: str, limit: int = 5) -> List[Dict[str, str]]:
+    r = get_redis_client()
+
+    if r is not None:
+        try:
+            items = r.lrange(f"conversation:{user_id}", 0, limit - 1)
+            history: List[Dict[str, str]] = []
+
+            for item in reversed(items):
+                d = json.loads(item)
+                history.append({"role": "user", "content": d["user_message"]})
+                history.append({"role": "assistant", "content": d["ai_response"]})
+
+            return history
+
+        except Exception as e:
+            logger.error(f"Redis context read failed: {e}")
+
+    return _get_context_from_mongo(user_id, limit)
+
+
+def _get_context_from_mongo(user_id: str, limit: int) -> List[Dict[str, str]]:
+    col = get_mongo_collection()
+    if col is None:
+        return []
+
+    try:
+        records = (
+            col.find({"user_id": user_id})
+            .sort("timestamp", -1)
+            .limit(limit)
+        )
+
+        history: List[Dict[str, str]] = []
+        for r in reversed(list(records)):
+            history.append({"role": "user", "content": r.get("user_message", "")})
+            history.append({"role": "assistant", "content": r.get("ai_response", "")})
+
+        return history
+
+    except Exception as e:
+        logger.error(f"Mongo context read failed: {e}")
+        return []
+
+
+# ======================
+# Sidebar History
+# ======================
+def load_recent_conversations(
+    user_id: str,
+    limit: int = 10
+) -> List[Tuple[str, str, str]]:
+
+    r = get_redis_client()
+    if r is None:
+        return []
+
+    try:
+        items = r.lrange(f"conversation:{user_id}", 0, limit - 1)
+        results = []
+
+        for item in items:
+            d = json.loads(item)
+            ts = datetime.fromisoformat(d["timestamp"])
+            results.append((
+                d["user_message"],
+                d["ai_response"],
+                ts.strftime("%b %d, %H:%M")
+            ))
+
+        return results
+
+    except Exception as e:
+        logger.error(f"Redis sidebar read failed: {e}")
+        return []
+
+
+# ======================
+# Delete / Clear
+# ======================
+def delete_last_conversation(user_id: str) -> bool:
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.lpop(f"conversation:{user_id}")
+        except Exception as e:
+            logger.error(f"Redis delete failed: {e}")
+
+    col = get_mongo_collection()
+    if col is not None:
+        try:
+            latest = col.find_one(
+                {"user_id": user_id},
+                sort=[("timestamp", -1)]
+            )
+            if latest:
+                col.delete_one({"_id": latest["_id"]})
+        except Exception as e:
+            logger.error(f"Mongo delete failed: {e}")
+
+    return True
+
+
+def clear_all_history(user_id: str) -> None:
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.delete(f"conversation:{user_id}")
+        except Exception as e:
+            logger.error(f"Redis clear failed: {e}")
+
+    col = get_mongo_collection()
+    if col is not None:
+        try:
+            col.delete_many({"user_id": user_id})
+        except Exception as e:
+            logger.error(f"Mongo clear failed: {e}")
