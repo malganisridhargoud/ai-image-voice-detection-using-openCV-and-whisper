@@ -1,7 +1,7 @@
 # auth.py
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, Optional
 
 import bcrypt
 from pymongo import MongoClient
@@ -10,6 +10,7 @@ from pymongo.collection import Collection
 from config import MONGODB_URI
 
 logger = logging.getLogger(__name__)
+_local_users: Dict[str, Dict[str, object]] = {}
 
 
 def get_users_collection() -> Optional[Collection]:
@@ -27,8 +28,8 @@ def get_users_collection() -> Optional[Collection]:
 
 
 def is_auth_available() -> bool:
-    """Quick check whether auth (Mongo) is available."""
-    return get_users_collection() is not None
+    """Auth is available via Mongo when reachable, else local in-memory fallback."""
+    return True
 
 
 def hash_password(password: str) -> bytes:
@@ -52,10 +53,18 @@ def verify_password(password: str, password_hash) -> bool:
 
 
 def create_user(username: str, password: str) -> bool:
-    """Create a new user. Returns False if user exists or DB unavailable."""
+    """Create a new user. Uses Mongo when available, else local in-memory fallback."""
     users = get_users_collection()
     if users is None:
-        return False
+        if username in _local_users:
+            return False
+        _local_users[username] = {
+            "username": username,
+            "password_hash": hash_password(password),
+            "created_at": datetime.now(timezone.utc),
+        }
+        logger.warning("Mongo unavailable; created local temporary user: %s", username)
+        return True
 
     # Check existence
     if users.find_one({"username": username}):
@@ -82,6 +91,11 @@ def authenticate_user(username: str, password: str) -> Optional[dict]:
     """
     users = get_users_collection()
     if users is None:
+        user = _local_users.get(username)
+        if not user:
+            return None
+        if verify_password(password, user.get("password_hash")):
+            return {"username": username}
         return None
 
     user = users.find_one({"username": username})

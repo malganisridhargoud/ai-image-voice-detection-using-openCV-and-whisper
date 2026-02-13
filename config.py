@@ -1,12 +1,14 @@
 # config.py
 import os
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 # ----------------------
-# Load environment
+# Load environment (resolve from project directory first)
 # ----------------------
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 logger = logging.getLogger(__name__)
 
