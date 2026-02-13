@@ -1,37 +1,95 @@
 # auth.py
-import bcrypt
+import logging
 from datetime import datetime, timezone
+from typing import Optional
+
+import bcrypt
 from pymongo import MongoClient
+from pymongo.collection import Collection
+
 from config import MONGODB_URI
 
-def get_users_collection():
-    client = MongoClient(MONGODB_URI)
-    return client["groq_chat_db"]["users"]
+logger = logging.getLogger(__name__)
+
+
+def get_users_collection() -> Optional[Collection]:
+    """Return the users collection or None if Mongo is unavailable."""
+    if not MONGODB_URI:
+        return None
+
+    try:
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        client.admin.command("ping")
+        return client["groq_chat_db"]["users"]
+    except Exception as exc:
+        logger.error("Users collection unavailable: %s", exc)
+        return None
+
+
+def is_auth_available() -> bool:
+    """Quick check whether auth (Mongo) is available."""
+    return get_users_collection() is not None
+
 
 def hash_password(password: str) -> bytes:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    """Hash a plaintext password using bcrypt."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
-def verify_password(password: str, password_hash: bytes) -> bool:
-    return bcrypt.checkpw(password.encode(), password_hash)
+
+def verify_password(password: str, password_hash) -> bool:
+    """
+    Verify a plaintext password against a stored hash.
+    Accepts bytes, bson.Binary, or str for password_hash.
+    """
+    if isinstance(password_hash, str):
+        password_hash = password_hash.encode("utf-8")
+    # bson.binary.Binary behaves like bytes, so bcrypt will accept it
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash)
+    except Exception as exc:
+        logger.warning("Password verification error: %s", exc)
+        return False
+
 
 def create_user(username: str, password: str) -> bool:
+    """Create a new user. Returns False if user exists or DB unavailable."""
     users = get_users_collection()
+    if users is None:
+        return False
+
+    # Check existence
     if users.find_one({"username": username}):
         return False
 
-    users.insert_one({
-        "username": username,
-        "password_hash": hash_password(password),
-        "created_at": datetime.now(timezone.utc)
-    })
-    return True
+    try:
+        users.insert_one(
+            {
+                "username": username,
+                "password_hash": hash_password(password),
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return True
+    except Exception as exc:
+        logger.error("Failed to create user: %s", exc)
+        return False
 
-def authenticate_user(username: str, password: str):
+
+def authenticate_user(username: str, password: str) -> Optional[dict]:
+    """
+    Authenticate and return the user document (with password_hash removed).
+    Returns None on failure or if auth backend is unavailable.
+    """
     users = get_users_collection()
+    if users is None:
+        return None
+
     user = users.find_one({"username": username})
     if not user:
         return None
 
-    if verify_password(password, user["password_hash"]):
+    if verify_password(password, user.get("password_hash")):
+        # Return a sanitized user object (avoid returning password hash)
+        user.pop("password_hash", None)
         return user
     return None
