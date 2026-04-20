@@ -10,8 +10,9 @@ An AI-powered mock interview system that conducts **personalized technical inter
 
 | Feature | Description |
 |---|---|
-| **Personalized Questions** | LLM generates interview questions targeting your weakest topics |
-| **Answer Evaluation** | AI scores answers on technical accuracy, clarity, and provides improvement suggestions |
+| **Dynamic Probing** | AI acts as a real interviewer, asking context-aware follow-up questions based on your answers to test depth and edge cases |
+| **Topic Selection** | Choose your interview focus from 20+ technical topics (React, Python, System Design, etc.) |
+| **Answer Evaluation** | AI scores your complete multi-turn thread on technical accuracy, clarity, and provides improvement suggestions |
 | **Feedback Loop** | Weak topics are tracked over time — questions adapt as you improve |
 | **Voice Input** | Answer with your voice using Groq Whisper transcription |
 | **Sentiment Analysis** | Confidence scoring via transformer-based sentiment analysis |
@@ -56,13 +57,13 @@ app.py                    ← Dual-mode Streamlit UI (Interview Coach + Chat)
 
 ### Interview Coach Mode (🎯)
 
-1. **Weak Topic Detection** — MongoDB aggregation pipeline finds your 3 lowest-scoring topics
-2. **Question Generation** — LLM creates a targeted interview question for those weak areas
-3. **Answer Submission** — Type or speak your answer (Whisper transcription)
-4. **AI Evaluation** — Feedback engine scores technical accuracy, clarity, and provides improvement suggestions
-5. **Topic Detection** — LLM auto-classifies the Q&A topic
-6. **Memory Update** — Results saved to MongoDB; weak topics recalculate for next round
-7. **Repeat** — Each new question adapts to your updated weak areas
+1. **Topic Selection** — Choose a specific technology or algorithmic topic to be interviewed on
+2. **Weak Topic Detection** — MongoDB aggregation pipeline finds your historically lowest-scoring topics to prioritize weaknesses
+3. **Question Generation** — LLM creates a targeted interview question 
+4. **Answer Submission** — Type or speak your answer (Whisper transcription)
+5. **Dynamic Probing** — Instead of generic feedback, the AI generates a follow-up question probing your reasoning
+6. **Thread Evaluation** — The Feedback engine scores your *entire transcript* (original answer + follow-up defense) providing a 1-10 grade
+7. **Memory Update** — Results saved to MongoDB; weak topics recalculate for next round
 
 ### Chat Mode (💬)
 
@@ -128,10 +129,11 @@ Open `http://localhost:8501` in your browser.
 1. **Login / Register** or continue as guest
 2. Select mode in the sidebar: **🎯 Interview Coach** or **💬 Chat**
 3. In Interview Coach:
-   - Read the generated question
-   - Type or record your answer
-   - Submit → view AI feedback with scores
-   - Click "Next Question" to continue
+   - Select your desired technical topic
+   - Read the generated question and submit your initial answer
+   - Defend your reasoning in the generated *Follow-up Question*
+   - Submit → view AI feedback on your full interview thread
+   - Click "Start Next Interview Topic" to continue
 4. In Chat mode: type or speak, upload images for detection
 
 ---
