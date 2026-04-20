@@ -39,11 +39,10 @@ def _get_llm() -> ChatGroq:
 # ---------------------
 # Evaluation Prompt
 # ---------------------
-EVAL_PROMPT = PromptTemplate.from_template("""You are an expert interview evaluator. Analyze this interview answer thoroughly.
+EVAL_PROMPT = PromptTemplate.from_template("""You are an expert interview evaluator. Analyze this multi-turn interview transcript thoroughly.
 
-**Question asked:** {question}
-
-**Candidate's answer:** {answer}
+**Interview Transcript:**
+{transcript}
 
 Provide your evaluation in EXACTLY this format:
 
@@ -90,31 +89,33 @@ def _extract_score(evaluation: str) -> float:
 # ---------------------
 # Core Function
 # ---------------------
-def analyze_answer(question: str, answer: str) -> Dict:
+def analyze_answer(qa_thread: list) -> Dict:
     """
-    Analyze an interview answer and return structured feedback.
-
-    Returns:
-        {
-            "sentiment": {"label": "POSITIVE", "score": "0.95"},
-            "evaluation": "... full LLM evaluation text ...",
-            "score": 7.5  (numeric, 0-10)
-        }
+    Analyze an interview thread and return structured feedback.
+    qa_thread: list of dicts [{"role": "interviewer", "content": "..."}, {"role": "candidate", "content": "..."}]
     """
-    # Sentiment analysis on the answer (confidence/tone indicator)
-    sentiment = detect_sentiment(answer)
+    # Combine answers for sentiment analysis
+    all_answers = " ".join([msg["content"] for msg in qa_thread if msg["role"] == "candidate"])
+    sentiment = detect_sentiment(all_answers)
 
     # Handle empty answers
-    if not (answer or "").strip():
+    if not all_answers.strip():
         return {
             "sentiment": sentiment,
             "evaluation": "No answer was provided. Please attempt an answer — even a partial one shows thinking ability.",
             "score": 0.0,
         }
 
+    # Format transcript
+    transcript_lines = []
+    for msg in qa_thread:
+        role_label = "Interviewer" if msg["role"] == "interviewer" else "Candidate"
+        transcript_lines.append(f"**{role_label}:** {msg['content']}")
+    transcript = "\n\n".join(transcript_lines)
+
     # LLM-based evaluation
     llm = _get_llm()
-    prompt = EVAL_PROMPT.format(question=question, answer=answer)
+    prompt = EVAL_PROMPT.format(transcript=transcript)
 
     try:
         response = llm.invoke(prompt)

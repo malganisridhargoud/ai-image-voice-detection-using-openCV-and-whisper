@@ -18,7 +18,7 @@ from ai_features import detect_objects_with_opencv, detect_sentiment
 from auth import authenticate_user, create_user, is_auth_available
 from config import AUDIO_MODEL, CONTEXT_WINDOW, GROQ_API_KEY, PRIMARY_MODEL
 from feedback_engine import analyze_answer
-from interview_engine import detect_topic, generate_question
+from interview_engine import INTERVIEW_TOPICS, detect_topic, generate_question, generate_followup
 from memory_manager import (
     clear_all_history,
     clear_interview_history,
@@ -255,6 +255,14 @@ if "interview_feedback" not in st.session_state:
 if "interview_count" not in st.session_state:
     st.session_state.interview_count = 0
 
+if "chosen_topic" not in st.session_state:
+    st.session_state.chosen_topic = INTERVIEW_TOPICS[0]
+
+if "interview_stage" not in st.session_state:
+    st.session_state.interview_stage = "initial"
+
+if "interview_thread" not in st.session_state:
+    st.session_state.interview_thread = []
 
 def reset_audio_widget() -> None:
     st.session_state.audio_uploader_key += 1
@@ -344,6 +352,8 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.interview_question = None
         st.session_state.interview_feedback = None
+        st.session_state.interview_stage = "initial"
+        st.session_state.interview_thread = []
         st.rerun()
 
     st.divider()
@@ -358,7 +368,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(f"Model: {PRIMARY_MODEL}")
-    st.caption("Memory: Active" if get_mongo_collection() is not None else "Memory: Offline")
+    st.caption("Memory: Active (MongoDB)" if get_mongo_collection() is not None else "Memory: Active (Local Fallback)")
 
     # -- Mode-specific sidebar content --
     if st.session_state.app_mode == "🎯 Interview Coach":
@@ -391,6 +401,8 @@ with st.sidebar:
             clear_interview_history(USER_ID)
             st.session_state.interview_question = None
             st.session_state.interview_feedback = None
+            st.session_state.interview_stage = "initial"
+            st.session_state.interview_thread = []
             st.session_state.interview_count = 0
             st.rerun()
 
@@ -456,17 +468,49 @@ if st.session_state.app_mode == "🎯 Interview Coach":
 
     st.divider()
 
+    # -- Topic selector --
+    selected_topic = st.selectbox(
+        "📚 Choose Interview Topic",
+        INTERVIEW_TOPICS,
+        index=INTERVIEW_TOPICS.index(st.session_state.chosen_topic) if st.session_state.chosen_topic in INTERVIEW_TOPICS else 0,
+        key="topic_selector",
+    )
+
+    if selected_topic != st.session_state.chosen_topic:
+        st.session_state.chosen_topic = selected_topic
+        st.session_state.interview_question = None
+        st.session_state.interview_feedback = None
+        st.session_state.interview_stage = "initial"
+        st.session_state.interview_thread = []
+        st.rerun()
+
+    st.divider()
+
     # -- Generate question if none exists --
     if st.session_state.interview_question is None:
-        with st.spinner("Generating a personalized question..."):
-            st.session_state.interview_question = generate_question(weak_topics)
+        with st.spinner(f"Generating a {st.session_state.chosen_topic} question..."):
+            st.session_state.interview_question = generate_question(weak_topics, st.session_state.chosen_topic)
             st.session_state.interview_feedback = None
+            st.session_state.interview_stage = "initial"
+            st.session_state.interview_thread = [{"role": "interviewer", "content": st.session_state.interview_question}]
 
-    # -- Display the question --
+    # -- Display the Thread History --
+    for msg in st.session_state.interview_thread[:-1]:
+        if msg["role"] == "interviewer":
+            st.markdown(f"**Interviewer:** {msg['content']}")
+        else:
+            st.markdown(f'<div style="margin-left: 20px; color: var(--muted);">**You:** {msg["content"]}</div>', unsafe_allow_html=True)
+            st.divider()
+
+    # -- Display the Active Question --
+    active_question = st.session_state.interview_thread[-1]["content"] if st.session_state.interview_thread else st.session_state.interview_question
+    
     st.markdown(
         f"""<div class="question-box">
-        <p style="color: var(--muted); font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 500;">INTERVIEW QUESTION</p>
-        <p style="font-size: 1.1rem; line-height: 1.6; color: var(--text);">{st.session_state.interview_question}</p>
+        <p style="color: var(--muted); font-size: 0.8rem; margin-bottom: 0.5rem; font-weight: 500;">
+        {'FOLLOW-UP QUESTION' if st.session_state.interview_stage == 'probing' else 'INTERVIEW QUESTION'}
+        </p>
+        <p style="font-size: 1.1rem; line-height: 1.6; color: var(--text);">{active_question}</p>
         </div>""",
         unsafe_allow_html=True,
     )
@@ -510,35 +554,51 @@ if st.session_state.app_mode == "🎯 Interview Coach":
     col_submit, col_skip = st.columns([3, 1])
 
     with col_submit:
-        submit_clicked = st.button("📤 Submit Answer", use_container_width=True, disabled=not final_answer)
+        submit_clicked = st.button("📤 Submit Answer", use_container_width=True, disabled=not final_answer or st.session_state.interview_stage == "feedback")
 
     with col_skip:
-        skip_clicked = st.button("⏭️ Skip", use_container_width=True)
+        skip_clicked = st.button("⏭️ Skip / Give Up", use_container_width=True)
 
     if skip_clicked:
         st.session_state.interview_question = None
         st.session_state.interview_feedback = None
+        st.session_state.interview_stage = "initial"
+        st.session_state.interview_thread = []
         reset_audio_widget()
         st.rerun()
 
     if submit_clicked and final_answer:
-        with st.spinner("Analyzing your answer..."):
-            # Get feedback
-            result = analyze_answer(st.session_state.interview_question, final_answer)
-            # Detect topic
-            topic = detect_topic(st.session_state.interview_question, final_answer)
+        st.session_state.interview_thread.append({"role": "candidate", "content": final_answer})
 
-            # Save to memory
-            save_interview(USER_ID, {
-                "question": st.session_state.interview_question,
-                "answer": final_answer,
-                "feedback": result,
-                "topic": topic,
-            })
+        if st.session_state.interview_stage == "initial":
+            with st.spinner("Generating follow-up question..."):
+                follow_up = generate_followup(st.session_state.interview_question, final_answer)
+                st.session_state.interview_thread.append({"role": "interviewer", "content": follow_up})
+                st.session_state.interview_stage = "probing"
+            st.rerun()
+            
+        elif st.session_state.interview_stage == "probing":
+            with st.spinner("Analyzing your full interview thread..."):
+                # Get feedback from the entire thread
+                result = analyze_answer(st.session_state.interview_thread)
+                topic = detect_topic(st.session_state.interview_question, final_answer)
 
-            st.session_state.interview_feedback = result
-            st.session_state.interview_feedback["topic"] = topic
-            st.session_state.interview_count += 1
+                # Format thread to save into memory seamlessly
+                all_q = " / ".join([m["content"] for m in st.session_state.interview_thread if m["role"] == "interviewer"])
+                all_a = " / ".join([m["content"] for m in st.session_state.interview_thread if m["role"] == "candidate"])
+
+                # Save to memory
+                save_interview(USER_ID, {
+                    "question": all_q,
+                    "answer": all_a,
+                    "feedback": result,
+                    "topic": topic,
+                })
+
+                st.session_state.interview_feedback = result
+                st.session_state.interview_feedback["topic"] = topic
+                st.session_state.interview_stage = "feedback"
+                st.session_state.interview_count += 1
 
     # -- Display feedback --
     if st.session_state.interview_feedback:
@@ -576,9 +636,11 @@ if st.session_state.app_mode == "🎯 Interview Coach":
 
         st.markdown("---")
 
-        if st.button("➡️ Next Question", use_container_width=True):
+        if st.button("➡️ Start Next Interview Topic", use_container_width=True):
             st.session_state.interview_question = None
             st.session_state.interview_feedback = None
+            st.session_state.interview_stage = "initial"
+            st.session_state.interview_thread = []
             reset_audio_widget()
             st.rerun()
 
