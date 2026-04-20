@@ -332,3 +332,188 @@ def clear_all_history(user_id: str) -> None:
 
     # Local
     _local_conversations.pop(user_id, None)
+
+
+# ============================================================
+# Interview Coach — Persistence (separate from chat history)
+# ============================================================
+
+# Local in-process fallback for interviews
+# Structure: { user_id: [ { "question": ..., "answer": ..., "feedback": {...}, "topic": ..., "timestamp": iso } ] }
+_local_interviews: Dict[str, List[Dict]] = {}
+
+
+def _get_interviews_collection() -> Optional[Collection]:
+    """Return the 'interviews' collection from MongoDB (separate from conversations)."""
+    global _mongo_client
+
+    if not MONGODB_URI:
+        return None
+
+    try:
+        if _mongo_client is None:
+            _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+            _mongo_client.admin.command("ping")
+
+        return _mongo_client["groq_chat_db"]["interviews"]
+    except Exception as exc:
+        logger.warning("Interview collection unavailable: %s", exc)
+        return None
+
+
+def save_interview(user_id: str, data: Dict) -> bool:
+    """
+    Save an interview Q&A with feedback to MongoDB (or local fallback).
+
+    Expected `data` keys:
+        - question (str)
+        - answer (str)
+        - feedback (dict with 'sentiment', 'evaluation', 'score')
+        - topic (str)
+    """
+    timestamp = datetime.now(timezone.utc)
+    doc = {
+        "user_id": user_id,
+        "question": data.get("question", ""),
+        "answer": data.get("answer", ""),
+        "feedback": data.get("feedback", {}),
+        "topic": data.get("topic", "General"),
+        "timestamp": timestamp,
+    }
+
+    # Redis — cache the current session question
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.set(f"session:{user_id}", data.get("question", ""), ex=3600)
+        except Exception as exc:
+            logger.warning("Redis session save failed: %s", exc)
+
+    # MongoDB — source of truth
+    col = _get_interviews_collection()
+    if col is not None:
+        try:
+            col.insert_one(doc)
+            return True
+        except Exception as exc:
+            logger.warning("Mongo interview save failed: %s", exc)
+
+    # Local fallback
+    _local_interviews.setdefault(user_id, []).append({
+        **doc,
+        "timestamp": timestamp.isoformat(),
+    })
+    return True
+
+
+def get_weak_topics(user_id: str) -> List[str]:
+    """
+    Return the 3 lowest-scoring topics for a user based on interview history.
+    Uses MongoDB aggregation pipeline when available, else local fallback.
+    """
+    # MongoDB aggregation
+    col = _get_interviews_collection()
+    if col is not None:
+        try:
+            pipeline = [
+                {"$match": {"user_id": user_id}},
+                {"$group": {
+                    "_id": "$topic",
+                    "avg_score": {"$avg": "$feedback.score"},
+                }},
+                {"$sort": {"avg_score": 1}},
+                {"$limit": 3},
+            ]
+            result = list(col.aggregate(pipeline))
+            topics = [r["_id"] for r in result if r["_id"]]
+            if topics:
+                return topics
+        except Exception as exc:
+            logger.warning("Mongo weak topics aggregation failed: %s", exc)
+
+    # Local fallback — compute from in-memory store
+    interviews = _local_interviews.get(user_id, [])
+    if not interviews:
+        return []
+
+    from collections import defaultdict
+    topic_scores: Dict[str, List[float]] = defaultdict(list)
+    for item in interviews:
+        topic = item.get("topic", "General")
+        score = 5.0
+        fb = item.get("feedback", {})
+        if isinstance(fb, dict) and "score" in fb:
+            try:
+                score = float(fb["score"])
+            except (TypeError, ValueError):
+                score = 5.0
+        topic_scores[topic].append(score)
+
+    # Average per topic, sort ascending, take 3
+    averages = [(t, sum(s) / len(s)) for t, s in topic_scores.items()]
+    averages.sort(key=lambda x: x[1])
+    return [t for t, _ in averages[:3]]
+
+
+def get_interview_history(user_id: str, limit: int = 10) -> List[Dict]:
+    """
+    Return recent interview records (newest → oldest).
+    Each record: { question, answer, feedback, topic, timestamp }
+    """
+    if limit <= 0:
+        return []
+
+    # MongoDB
+    col = _get_interviews_collection()
+    if col is not None:
+        try:
+            rows = list(
+                col.find({"user_id": user_id}, {"_id": 0, "user_id": 0})
+                .sort("timestamp", -1)
+                .limit(limit)
+            )
+            # Convert datetime to string for display
+            for row in rows:
+                ts = row.get("timestamp")
+                if hasattr(ts, "strftime"):
+                    row["timestamp"] = ts.strftime("%b %d, %H:%M")
+            return rows
+        except Exception as exc:
+            logger.warning("Mongo interview history read failed: %s", exc)
+
+    # Local fallback
+    items = _local_interviews.get(user_id, [])
+    result = []
+    for item in reversed(items[-limit:]):
+        entry = dict(item)
+        ts = entry.get("timestamp", "")
+        if isinstance(ts, str) and ts:
+            try:
+                dt = datetime.fromisoformat(ts)
+                entry["timestamp"] = dt.strftime("%b %d, %H:%M")
+            except Exception:
+                pass
+        result.append(entry)
+    return result
+
+
+def clear_interview_history(user_id: str) -> None:
+    """Clear all interview records for a user."""
+    # Redis
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.delete(f"session:{user_id}")
+        except Exception as exc:
+            logger.warning("Redis interview clear failed: %s", exc)
+
+    # MongoDB
+    col = _get_interviews_collection()
+    if col is not None:
+        try:
+            col.delete_many({"user_id": user_id})
+        except Exception as exc:
+            logger.warning("Mongo interview clear failed: %s", exc)
+
+    # Local
+    _local_interviews.pop(user_id, None)
