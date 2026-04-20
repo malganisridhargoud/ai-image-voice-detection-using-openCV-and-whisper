@@ -7,7 +7,7 @@ import logging
 from typing import List, Optional
 
 from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 from config import GROQ_API_KEY, PRIMARY_MODEL
 
