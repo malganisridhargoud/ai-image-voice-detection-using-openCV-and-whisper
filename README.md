@@ -1,5 +1,4 @@
 # AI Interview Coach with Memory + Feedback Loop
-
 An AI-powered mock interview system that conducts **personalized technical interviews** based on your weak areas. Built with Groq LLMs, LangChain, and a memory-driven feedback loop.
 
 > Built an AI Interview Coach using Groq + LangChain that conducts personalized mock interviews based on user weak areas. Implemented a feedback engine for answer evaluation and used Redis (session memory) and MongoDB (long-term tracking) to improve question relevance over time. Integrated voice input (Whisper) and sentiment analysis for confidence assessment.
